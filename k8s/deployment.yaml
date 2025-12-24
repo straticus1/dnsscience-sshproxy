@@ -27,25 +27,25 @@ spec:
               ssh-keygen -t ed25519 -f /app/keys/host_key -N "" -q
             fi &&
             go build -o sshproxy . &&
-            ./sshproxy -config /app/config/config.json
+            ./sshproxy -config /etc/sshproxy/config.json
         ports:
         - containerPort: 2222
           name: ssh
           protocol: TCP
         volumeMounts:
         - name: config
-          mountPath: /app/config
+          mountPath: /etc/sshproxy
         - name: source
           mountPath: /app
         - name: keys
           mountPath: /app/keys
         resources:
           limits:
-            cpu: "500m"
-            memory: "128Mi"
+            cpu: "1000m"
+            memory: "512Mi"
           requests:
-            cpu: "100m"
-            memory: "64Mi"
+            cpu: "200m"
+            memory: "256Mi"
         livenessProbe:
           tcpSocket:
             port: 2222
