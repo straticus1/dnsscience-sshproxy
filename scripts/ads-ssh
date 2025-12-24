@@ -1,0 +1,215 @@
+#!/bin/bash
+#
+# ads-ssh - AfterDark SSH Proxy wrapper
+#
+# Usage:
+#   ads-ssh                     # Connect to default host
+#   ads-ssh hostname            # Connect to specific host
+#   ads-ssh user@hostname       # Connect as specific user to host
+#   ads-ssh -l                  # List active sessions
+#   ads-ssh -k                  # Kill all your sessions
+#   ads-ssh -h                  # Show help
+#
+
+PROXY_HOST="sshgw.afterdarksys.com"
+PROXY_PORT="2222"
+API_URL="https://sshgw.afterdarksys.com"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+show_help() {
+    cat << 'EOF'
+AfterDark SSH Proxy Client
+
+USAGE:
+    ads-ssh [OPTIONS] [TARGET]
+
+OPTIONS:
+    -l, --list      List your active SSH sessions
+    -k, --kill      Kill all your active sessions
+    -K, --kill-all  Kill a specific session (prompts for selection)
+    -s, --status    Check proxy service status
+    -h, --help      Show this help message
+
+TARGET FORMATS:
+    hostname              Connect to hostname (uses your default user)
+    user@hostname         Connect as user to hostname
+    hostname:port         Connect to hostname on specific port
+
+EXAMPLES:
+    ads-ssh                           # Connect to your default host
+    ads-ssh webserver1                # Connect to webserver1
+    ads-ssh root@dbserver             # Connect as root to dbserver
+    ads-ssh -l                        # List active sessions
+
+AUTHENTICATION:
+    Uses SSH keys configured in your AfterDark account.
+    Manage keys at: https://login.afterdarksys.com/settings-security.html
+
+EOF
+}
+
+get_token() {
+    # Try to get token from environment or config file
+    if [ -n "$AFTERDARK_TOKEN" ]; then
+        echo "$AFTERDARK_TOKEN"
+        return
+    fi
+
+    # Check config file
+    if [ -f "$HOME/.config/afterdark/token" ]; then
+        cat "$HOME/.config/afterdark/token"
+        return
+    fi
+
+    # Check legacy location
+    if [ -f "$HOME/.afterdark_token" ]; then
+        cat "$HOME/.afterdark_token"
+        return
+    fi
+
+    echo ""
+}
+
+get_user_id() {
+    local token=$(get_token)
+    if [ -z "$token" ]; then
+        echo ""
+        return
+    fi
+
+    # Extract user ID from JWT (base64 decode the payload)
+    echo "$token" | cut -d'.' -f2 | base64 -d 2>/dev/null | grep -o '"sub":"[^"]*"' | cut -d'"' -f4
+}
+
+list_sessions() {
+    local token=$(get_token)
+    local user_id=$(get_user_id)
+
+    if [ -z "$token" ] || [ -z "$user_id" ]; then
+        echo -e "${YELLOW}Not authenticated. Set AFTERDARK_TOKEN or run 'ads-login'${NC}"
+        echo ""
+        echo "To authenticate, save your token to ~/.config/afterdark/token"
+        return 1
+    fi
+
+    echo -e "${BLUE}Active SSH Sessions${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    local response=$(curl -s -H "Authorization: Bearer $token" "$API_URL/api/v1/users/$user_id/sessions")
+
+    if [ -z "$response" ] || echo "$response" | grep -q '"error"'; then
+        echo -e "${RED}Failed to fetch sessions${NC}"
+        return 1
+    fi
+
+    # Parse and display sessions
+    echo "$response" | python3 -c "
+import json, sys
+from datetime import datetime
+
+data = json.load(sys.stdin)
+sessions = [s for s in (data.get('sessions') or []) if s.get('active')]
+
+if not sessions:
+    print('No active sessions')
+    sys.exit(0)
+
+for i, s in enumerate(sessions, 1):
+    started = datetime.fromisoformat(s['started_at'].replace('Z', '+00:00'))
+    duration = datetime.now(started.tzinfo) - started if started.tzinfo else ''
+    print(f\"{i}. {s.get('target_host', 'unknown')} from {s.get('remote_addr', 'unknown')}\")
+    print(f\"   Started: {started.strftime('%Y-%m-%d %H:%M:%S')}\")
+    print(f\"   Session ID: {s['id']}\")
+    print()
+" 2>/dev/null || echo -e "${RED}Failed to parse sessions${NC}"
+}
+
+kill_sessions() {
+    local token=$(get_token)
+    local user_id=$(get_user_id)
+
+    if [ -z "$token" ] || [ -z "$user_id" ]; then
+        echo -e "${YELLOW}Not authenticated${NC}"
+        return 1
+    fi
+
+    echo -e "${YELLOW}Killing all active sessions...${NC}"
+
+    local response=$(curl -s -X DELETE -H "Authorization: Bearer $token" "$API_URL/api/v1/users/$user_id/sessions")
+
+    if echo "$response" | grep -q '"killed"'; then
+        local killed=$(echo "$response" | grep -o '"killed":[0-9]*' | cut -d':' -f2)
+        echo -e "${GREEN}Killed $killed session(s)${NC}"
+    else
+        echo -e "${RED}Failed to kill sessions${NC}"
+    fi
+}
+
+check_status() {
+    echo -e "${BLUE}Checking SSH Proxy status...${NC}"
+
+    local health=$(curl -s --connect-timeout 5 "$API_URL/health" 2>/dev/null)
+
+    if echo "$health" | grep -q '"healthy"'; then
+        echo -e "${GREEN}✓ SSH Proxy API is healthy${NC}"
+    else
+        echo -e "${RED}✗ SSH Proxy API is not responding${NC}"
+    fi
+
+    # Check SSH port
+    if nc -z -w 5 "$PROXY_HOST" "$PROXY_PORT" 2>/dev/null; then
+        echo -e "${GREEN}✓ SSH port $PROXY_PORT is open${NC}"
+    else
+        echo -e "${RED}✗ SSH port $PROXY_PORT is not reachable${NC}"
+    fi
+}
+
+connect() {
+    local target="$1"
+    local ssh_user=""
+    local ssh_host=""
+
+    if [ -z "$target" ]; then
+        # No target - connect with just username (will use default host)
+        ssh -p "$PROXY_PORT" "$PROXY_HOST"
+    elif [[ "$target" == *"@"* ]]; then
+        # user@host format
+        ssh_user="${target%%@*}"
+        ssh_host="${target#*@}"
+        # Format: host+user@proxy
+        ssh -p "$PROXY_PORT" "${ssh_host}+${ssh_user}@${PROXY_HOST}"
+    else
+        # Just hostname
+        ssh -p "$PROXY_PORT" "${target}+\$USER@${PROXY_HOST}"
+    fi
+}
+
+# Main
+case "${1:-}" in
+    -h|--help)
+        show_help
+        ;;
+    -l|--list)
+        list_sessions
+        ;;
+    -k|--kill)
+        kill_sessions
+        ;;
+    -s|--status)
+        check_status
+        ;;
+    -*)
+        echo -e "${RED}Unknown option: $1${NC}"
+        echo "Use -h for help"
+        exit 1
+        ;;
+    *)
+        connect "$1"
+        ;;
+esac
