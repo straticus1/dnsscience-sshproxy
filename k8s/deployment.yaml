@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sshproxy
+  namespace: sshproxy
+  labels:
+    app: sshproxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sshproxy
+  template:
+    metadata:
+      labels:
+        app: sshproxy
+    spec:
+      containers:
+      - name: sshproxy
+        image: golang:1.22-alpine
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            apk add --no-cache git openssh-keygen &&
+            cd /app &&
+            if [ ! -f /app/keys/host_key ]; then
+              ssh-keygen -t ed25519 -f /app/keys/host_key -N "" -q
+            fi &&
+            go build -o sshproxy . &&
+            ./sshproxy -config /app/config/config.json
+        ports:
+        - containerPort: 2222
+          name: ssh
+          protocol: TCP
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+        - name: source
+          mountPath: /app
+        - name: keys
+          mountPath: /app/keys
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "128Mi"
+          requests:
+            cpu: "100m"
+            memory: "64Mi"
+        livenessProbe:
+          tcpSocket:
+            port: 2222
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          tcpSocket:
+            port: 2222
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: sshproxy-config
+      - name: source
+        emptyDir: {}
+      - name: keys
+        emptyDir: {}
+      initContainers:
+      - name: clone-source
+        image: alpine/git
+        command: ['git', 'clone', 'https://github.com/straticus1/dnsscience-sshproxy.git', '/app']
+        volumeMounts:
+        - name: source
+          mountPath: /app

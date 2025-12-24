@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  sshproxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sshproxy
+    restart: unless-stopped
+    ports:
+      - "2222:2222"
+    volumes:
+      - ./config.json:/app/config/config.json:ro
+      - ./host_key:/app/keys/host_key:ro
+    environment:
+      - TZ=UTC
+    networks:
+      - proxy-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 128M
+        reservations:
+          cpus: '0.1'
+          memory: 32M
+
+networks:
+  proxy-net:
+    driver: bridge

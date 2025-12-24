@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sshproxy-config
+  namespace: sshproxy
+data:
+  config.json: |
+    {
+      "listen_addr": ":2222",
+      "host_key_path": "/app/keys/host_key",
+      "users": [
+        {
+          "login_id": "admin",
+          "allowed_hosts": ["*"],
+          "default_host": "localhost",
+          "public_keys": [],
+          "password_hash": ""
+        }
+      ]
+    }

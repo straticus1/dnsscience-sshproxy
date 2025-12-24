@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sshproxy
+  labels:
+    app: sshproxy
+    managed-by: afterdark

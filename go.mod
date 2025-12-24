@@ -1,6 +1,6 @@
 module github.com/hostscience/sshproxy
 
-go 1.25.2
+go 1.22
 
 require golang.org/x/crypto v0.46.0
 
