@@ -1,0 +1,41 @@
+{
+  "listen_addr": ":2222",
+  "host_key_path": "host_key",
+  "users": [
+    {
+      "login_id": "ryan",
+      "allowed_hosts": [
+        "foo.com",
+        "bar.foo.com",
+        "*.internal.example.com"
+      ],
+      "default_host": "foo.com",
+      "public_keys": [
+        "ssh-rsa AAAAB3NzaC1... user@host",
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... user@host"
+      ],
+      "password_hash": "$2a$10$..."
+    },
+    {
+      "login_id": "ryan@is1.morgan",
+      "allowed_hosts": [
+        "prod-server-01.example.com",
+        "prod-server-02.example.com",
+        "*.staging.example.com"
+      ],
+      "default_host": "prod-server-01.example.com",
+      "public_keys": [],
+      "password_hash": ""
+    },
+    {
+      "login_id": "admin",
+      "allowed_hosts": [
+        "*"
+      ],
+      "default_host": "bastion.internal",
+      "public_keys": [
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5... admin@corp"
+      ]
+    }
+  ]
+}
