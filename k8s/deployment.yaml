@@ -32,6 +32,22 @@ spec:
         - containerPort: 2222
           name: ssh
           protocol: TCP
+        - containerPort: 8080
+          name: api
+          protocol: TCP
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: sshproxy-secrets
+              key: DATABASE_URL
+              optional: true
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: sshproxy-secrets
+              key: JWT_SECRET
+              optional: true
         volumeMounts:
         - name: config
           mountPath: /etc/sshproxy

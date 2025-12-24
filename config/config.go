@@ -8,17 +8,24 @@ import (
 )
 
 type Config struct {
-	ListenAddr string  `json:"listen_addr"`
+	ListenAddr  string `json:"listen_addr"`
 	HostKeyPath string `json:"host_key_path"`
-	Users      []User  `json:"users"`
+	Users       []User `json:"users"`
+
+	// Database-backed auth (optional)
+	DatabaseURL string `json:"database_url,omitempty"`
+
+	// Management API (optional)
+	APIAddr   string `json:"api_addr,omitempty"`
+	JWTSecret string `json:"jwt_secret,omitempty"`
 }
 
 type User struct {
-	LoginID       string   `json:"login_id"`
-	AllowedHosts  []string `json:"allowed_hosts"`
-	DefaultHost   string   `json:"default_host"`
-	PublicKeys    []string `json:"public_keys,omitempty"`
-	PasswordHash  string   `json:"password_hash,omitempty"`
+	LoginID      string   `json:"login_id"`
+	AllowedHosts []string `json:"allowed_hosts"`
+	DefaultHost  string   `json:"default_host"`
+	PublicKeys   []string `json:"public_keys,omitempty"`
+	PasswordHash string   `json:"password_hash,omitempty"`
 }
 
 func Load(path string) (*Config, error) {
@@ -34,6 +41,17 @@ func Load(path string) (*Config, error) {
 
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = ":2222"
+	}
+
+	// Allow environment variable overrides
+	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
+		cfg.DatabaseURL = dbURL
+	}
+	if apiAddr := os.Getenv("API_ADDR"); apiAddr != "" {
+		cfg.APIAddr = apiAddr
+	}
+	if jwtSecret := os.Getenv("JWT_SECRET"); jwtSecret != "" {
+		cfg.JWTSecret = jwtSecret
 	}
 
 	return &cfg, nil

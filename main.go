@@ -12,8 +12,10 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/hostscience/sshproxy/api"
 	"github.com/hostscience/sshproxy/config"
 	"github.com/hostscience/sshproxy/proxy"
+	"github.com/hostscience/sshproxy/store"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -53,7 +55,36 @@ func main() {
 		log.Fatalf("Failed to load host key: %v", err)
 	}
 
-	server := proxy.NewServer(cfg, hostKey)
+	// Initialize store if database is configured
+	var dataStore store.Store
+	if cfg.DatabaseURL != "" {
+		log.Printf("Connecting to database...")
+		dataStore, err = store.NewPostgresStore(cfg.DatabaseURL)
+		if err != nil {
+			log.Printf("[WARN] Failed to connect to database: %v", err)
+			log.Printf("[WARN] Falling back to config-file authentication")
+		} else {
+			log.Printf("Database connected successfully")
+		}
+	}
+
+	// Create SSH server
+	server := proxy.NewServer(cfg, hostKey, dataStore)
+
+	// Start Management API if enabled
+	if cfg.APIAddr != "" && dataStore != nil {
+		apiServer := api.NewServer(api.Config{
+			ListenAddr: cfg.APIAddr,
+			JWTSecret:  cfg.JWTSecret,
+			Store:      dataStore,
+		})
+
+		go func() {
+			if err := apiServer.ListenAndServe(); err != nil {
+				log.Printf("[API] Server error: %v", err)
+			}
+		}()
+	}
 
 	// Handle graceful shutdown
 	sigCh := make(chan os.Signal, 1)
@@ -63,6 +94,11 @@ func main() {
 		<-sigCh
 		active, total := server.Stats()
 		log.Printf("[SHUTDOWN] Stopping... (active: %d, total served: %d)", active, total)
+
+		if dataStore != nil {
+			dataStore.Close()
+		}
+
 		os.Exit(0)
 	}()
 

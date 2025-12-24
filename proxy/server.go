@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -8,32 +9,52 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/hostscience/sshproxy/config"
+	"github.com/hostscience/sshproxy/store"
 	"golang.org/x/crypto/ssh"
 )
 
 type Server struct {
-	config      *config.Config
-	sshConfig   *ssh.ServerConfig
-	connCount   atomic.Int64
-	totalConns  atomic.Int64
+	config     *config.Config
+	store      store.Store
+	sshConfig  *ssh.ServerConfig
+	connCount  atomic.Int64
+	totalConns atomic.Int64
+
+	// Session tracking for kill support
+	sessions   map[string]*activeSession
+	sessionsMu sync.RWMutex
+}
+
+type activeSession struct {
+	id         string
+	userID     string
+	conn       ssh.Conn
+	cancelFunc context.CancelFunc
 }
 
 type connContext struct {
 	user       *config.User
+	dbUser     *store.User
 	targetHost string
 	targetUser string
+	keyID      string
 }
 
-func NewServer(cfg *config.Config, hostKey ssh.Signer) *Server {
-	s := &Server{config: cfg}
+func NewServer(cfg *config.Config, hostKey ssh.Signer, dataStore store.Store) *Server {
+	s := &Server{
+		config:   cfg,
+		store:    dataStore,
+		sessions: make(map[string]*activeSession),
+	}
 
 	s.sshConfig = &ssh.ServerConfig{
-		PasswordCallback: s.passwordCallback,
+		PasswordCallback:  s.passwordCallback,
 		PublicKeyCallback: s.publicKeyCallback,
 		BannerCallback: func(conn ssh.ConnMetadata) string {
-			return "SSH Proxy - Authorized access only\r\n"
+			return "AfterDark SSH Proxy - Authorized access only\r\n"
 		},
 	}
 	s.sshConfig.AddHostKey(hostKey)
@@ -44,6 +65,18 @@ func NewServer(cfg *config.Config, hostKey ssh.Signer) *Server {
 func (s *Server) passwordCallback(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 	loginID, targetHost, targetUser := parseUsername(conn.User())
 
+	// Try database auth first
+	if s.store != nil {
+		dbUser, err := s.store.GetUser(context.Background(), loginID)
+		if err == nil && dbUser.Enabled {
+			// Database user exists but password auth not supported for DB users
+			// They must use SSH keys
+			log.Printf("[AUTH] DB user %q attempted password auth (not supported)", loginID)
+			return nil, fmt.Errorf("password auth not supported, use SSH key")
+		}
+	}
+
+	// Fall back to config file auth
 	user := s.config.FindUser(loginID)
 	if user == nil {
 		log.Printf("[AUTH] Failed: unknown user %q from %s", loginID, conn.RemoteAddr())
@@ -67,6 +100,7 @@ func (s *Server) passwordCallback(conn ssh.ConnMetadata, password []byte) (*ssh.
 			"login_id":    loginID,
 			"target_host": targetHost,
 			"target_user": targetUser,
+			"auth_source": "config",
 		},
 	}, nil
 }
@@ -74,27 +108,66 @@ func (s *Server) passwordCallback(conn ssh.ConnMetadata, password []byte) (*ssh.
 func (s *Server) publicKeyCallback(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 	loginID, targetHost, targetUser := parseUsername(conn.User())
 
+	// Try database auth first
+	if s.store != nil {
+		dbUser, err := s.store.GetUser(context.Background(), loginID)
+		if err == nil && dbUser.Enabled {
+			// Check database keys
+			keys, err := s.store.GetActiveKeys(context.Background(), loginID)
+			if err == nil {
+				for _, authorizedKey := range keys {
+					parsed, _, _, _, err := ssh.ParseAuthorizedKey([]byte(authorizedKey))
+					if err != nil {
+						continue
+					}
+					if keysEqual(parsed, key) {
+						log.Printf("[AUTH] Success: %q via DB pubkey from %s", loginID, conn.RemoteAddr())
+
+						// Get key ID for session tracking
+						keyID := ""
+						dbKeys, _ := s.store.ListKeys(context.Background(), loginID)
+						for _, k := range dbKeys {
+							if k.PublicKey == authorizedKey {
+								keyID = k.ID
+								break
+							}
+						}
+
+						return &ssh.Permissions{
+							Extensions: map[string]string{
+								"login_id":    loginID,
+								"target_host": targetHost,
+								"target_user": targetUser,
+								"auth_source": "database",
+								"key_id":      keyID,
+							},
+						}, nil
+					}
+				}
+			}
+		}
+	}
+
+	// Fall back to config file auth
 	user := s.config.FindUser(loginID)
 	if user == nil {
 		log.Printf("[AUTH] Failed: unknown user %q from %s", loginID, conn.RemoteAddr())
 		return nil, fmt.Errorf("unknown user")
 	}
 
-	keyStr := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
-
 	for _, authorizedKey := range user.PublicKeys {
 		parsed, _, _, _, err := ssh.ParseAuthorizedKey([]byte(authorizedKey))
 		if err != nil {
 			continue
 		}
-		if string(ssh.MarshalAuthorizedKey(parsed)) == string(ssh.MarshalAuthorizedKey(key)) {
-			log.Printf("[AUTH] Success: %q via pubkey from %s", loginID, conn.RemoteAddr())
+		if keysEqual(parsed, key) {
+			log.Printf("[AUTH] Success: %q via config pubkey from %s", loginID, conn.RemoteAddr())
 			return &ssh.Permissions{
 				Extensions: map[string]string{
 					"login_id":    loginID,
 					"target_host": targetHost,
 					"target_user": targetUser,
-					"pubkey":      keyStr,
+					"auth_source": "config",
 				},
 			}, nil
 		}
@@ -102,6 +175,10 @@ func (s *Server) publicKeyCallback(conn ssh.ConnMetadata, key ssh.PublicKey) (*s
 
 	log.Printf("[AUTH] Failed: no matching key for %q from %s", loginID, conn.RemoteAddr())
 	return nil, fmt.Errorf("invalid key")
+}
+
+func keysEqual(a, b ssh.PublicKey) bool {
+	return string(a.Marshal()) == string(b.Marshal())
 }
 
 func parseUsername(username string) (loginID, targetHost, targetUser string) {
@@ -175,16 +252,33 @@ func (s *Server) handleConnection(netConn net.Conn) {
 	loginID := sshConn.Permissions.Extensions["login_id"]
 	targetHost := sshConn.Permissions.Extensions["target_host"]
 	targetUser := sshConn.Permissions.Extensions["target_user"]
+	authSource := sshConn.Permissions.Extensions["auth_source"]
+	keyID := sshConn.Permissions.Extensions["key_id"]
 
-	user := s.config.FindUser(loginID)
-	if user == nil {
-		log.Printf("[CONN] User %q not found after auth?", loginID)
-		return
+	var allowedHosts []string
+	var defaultHost string
+
+	if authSource == "database" && s.store != nil {
+		dbUser, err := s.store.GetUser(context.Background(), loginID)
+		if err != nil {
+			log.Printf("[CONN] Failed to load DB user %q: %v", loginID, err)
+			return
+		}
+		allowedHosts = dbUser.AllowedHosts
+		defaultHost = dbUser.DefaultHost
+	} else {
+		user := s.config.FindUser(loginID)
+		if user == nil {
+			log.Printf("[CONN] User %q not found after auth?", loginID)
+			return
+		}
+		allowedHosts = user.AllowedHosts
+		defaultHost = user.DefaultHost
 	}
 
 	// Resolve target host
 	if targetHost == "" {
-		targetHost = user.DefaultHost
+		targetHost = defaultHost
 	}
 	if targetHost == "" {
 		log.Printf("[CONN] No target host for %q", loginID)
@@ -192,23 +286,83 @@ func (s *Server) handleConnection(netConn net.Conn) {
 	}
 
 	// ACL check
-	if !user.CanAccessHost(targetHost) {
+	if !canAccessHost(allowedHosts, targetHost) {
 		log.Printf("[ACL] Denied: %q cannot access %q", loginID, targetHost)
 		return
 	}
 
-	log.Printf("[PROXY] %q -> %s (user: %s)", loginID, targetHost, targetUser)
+	log.Printf("[PROXY] %q -> %s (user: %s, auth: %s)", loginID, targetHost, targetUser, authSource)
+
+	// Track session in database
+	var sessionID string
+	if s.store != nil {
+		sess := &store.Session{
+			UserID:     loginID,
+			RemoteAddr: remoteAddr,
+			TargetHost: targetHost,
+			KeyID:      keyID,
+		}
+		if err := s.store.CreateSession(context.Background(), sess); err != nil {
+			log.Printf("[WARN] Failed to create session record: %v", err)
+		} else {
+			sessionID = sess.ID
+		}
+	}
+
+	// Track active session for kill support
+	ctx, cancel := context.WithCancel(context.Background())
+	if sessionID != "" {
+		s.sessionsMu.Lock()
+		s.sessions[sessionID] = &activeSession{
+			id:         sessionID,
+			userID:     loginID,
+			conn:       sshConn,
+			cancelFunc: cancel,
+		}
+		s.sessionsMu.Unlock()
+	}
 
 	// Handle global requests (keepalive, etc)
 	go ssh.DiscardRequests(reqs)
 
 	// Handle channels
 	for newChan := range chans {
-		go s.handleChannel(newChan, targetHost, targetUser, loginID)
+		go s.handleChannel(ctx, newChan, targetHost, targetUser, loginID)
 	}
+
+	// Cleanup
+	if sessionID != "" {
+		s.sessionsMu.Lock()
+		delete(s.sessions, sessionID)
+		s.sessionsMu.Unlock()
+
+		if s.store != nil {
+			s.store.EndSession(context.Background(), sessionID)
+		}
+	}
+	cancel()
 }
 
-func (s *Server) handleChannel(newChan ssh.NewChannel, targetHost, targetUser, loginID string) {
+func canAccessHost(allowedHosts []string, host string) bool {
+	host = strings.ToLower(host)
+	for _, allowed := range allowedHosts {
+		if allowed == "*" {
+			return true
+		}
+		if strings.ToLower(allowed) == host {
+			return true
+		}
+		if strings.HasPrefix(allowed, "*.") {
+			suffix := strings.ToLower(allowed[1:])
+			if strings.HasSuffix(host, suffix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *Server) handleChannel(ctx context.Context, newChan ssh.NewChannel, targetHost, targetUser, loginID string) {
 	if newChan.ChannelType() != "session" {
 		newChan.Reject(ssh.UnknownChannelType, "only session channels supported")
 		return
@@ -227,7 +381,7 @@ func (s *Server) handleChannel(newChan ssh.NewChannel, targetHost, targetUser, l
 		targetAddr = targetAddr + ":22"
 	}
 
-	backendConn, err := net.DialTimeout("tcp", targetAddr, 10*1e9)
+	backendConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 	if err != nil {
 		log.Printf("[PROXY] Failed to connect to %s: %v", targetAddr, err)
 		channel.Write([]byte(fmt.Sprintf("Failed to connect to backend: %v\r\n", err)))
@@ -240,36 +394,54 @@ func (s *Server) handleChannel(newChan ssh.NewChannel, targetHost, targetUser, l
 	// Handle session requests (pty-req, shell, exec, etc)
 	go func() {
 		for req := range requests {
-			// For TCP tunnel mode, we just acknowledge requests
-			// The actual terminal handling happens on the backend
 			if req.WantReply {
 				req.Reply(true, nil)
 			}
 		}
 	}()
 
-	// Bidirectional copy
-	var wg sync.WaitGroup
-	wg.Add(2)
+	// Bidirectional copy with context cancellation support
+	done := make(chan struct{}, 2)
 
 	go func() {
-		defer wg.Done()
 		io.Copy(backendConn, channel)
 		if tc, ok := backendConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
+		done <- struct{}{}
 	}()
 
 	go func() {
-		defer wg.Done()
 		io.Copy(channel, backendConn)
 		channel.CloseWrite()
+		done <- struct{}{}
 	}()
 
-	wg.Wait()
+	// Wait for either copy to finish or context cancellation
+	select {
+	case <-done:
+	case <-ctx.Done():
+		log.Printf("[PROXY] Session killed for %q", loginID)
+	}
+
 	log.Printf("[PROXY] Session ended for %q -> %s", loginID, targetHost)
 }
 
 func (s *Server) Stats() (active, total int64) {
 	return s.connCount.Load(), s.totalConns.Load()
+}
+
+// KillSession terminates an active session by ID
+func (s *Server) KillSession(sessionID string) bool {
+	s.sessionsMu.RLock()
+	sess, exists := s.sessions[sessionID]
+	s.sessionsMu.RUnlock()
+
+	if !exists {
+		return false
+	}
+
+	sess.cancelFunc()
+	sess.conn.Close()
+	return true
 }

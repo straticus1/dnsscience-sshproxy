@@ -8,6 +8,7 @@ data:
     {
       "listen_addr": ":2222",
       "host_key_path": "/app/keys/host_key",
+      "api_addr": ":8080",
       "users": [
         {
           "login_id": "admin",
